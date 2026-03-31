@@ -3,12 +3,39 @@ import json
 import os
 import urllib.parse
 import urllib.request
+from pathlib import Path
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
 
 HOST = os.environ.get('F1_EXTERNAL_WEBHOOK_HOST', '0.0.0.0')
 PORT = int(os.environ.get('PORT') or os.environ.get('F1_EXTERNAL_WEBHOOK_PORT', '8780'))
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
 APPROVAL_EVENT_URL = os.environ.get('F1_APPROVAL_EVENT_URL', '').strip()
+EVENTS_FILE = Path(os.environ.get('F1_EVENTS_FILE', '/tmp/f1_approval_events.json'))
+FORWARD_MODE = os.environ.get('F1_APPROVAL_FORWARD_MODE', 'store').strip().lower()
+
+
+def load_events():
+    if not EVENTS_FILE.exists():
+        return {'events': []}
+    try:
+        return json.loads(EVENTS_FILE.read_text(encoding='utf-8'))
+    except Exception:
+        return {'events': []}
+
+
+def save_events(data):
+    EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    EVENTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def append_event(payload):
+    data = load_events()
+    payload['received_at'] = datetime.now(timezone.utc).isoformat()
+    data.setdefault('events', []).append(payload)
+    save_events(data)
+    return payload
 
 
 def api_post(path, data):
@@ -53,14 +80,20 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == '/health':
-            return self._json(200, {'ok': True})
+        parsed = urlparse(self.path)
+        if parsed.path == '/health':
+            return self._json(200, {'ok': True, 'forward_mode': FORWARD_MODE})
+        if parsed.path == '/approval/pending':
+            qs = parse_qs(parsed.query)
+            task_id = (qs.get('task_id') or [''])[0]
+            data = load_events()
+            events = data.get('events', [])
+            if task_id:
+                events = [e for e in events if e.get('task_id') == task_id]
+            return self._json(200, {'ok': True, 'events': events})
         return self._json(404, {'error': 'not found'})
 
     def do_POST(self):
-        if self.path != '/telegram/callback':
-            return self._json(404, {'error': 'not found'})
-
         length = int(self.headers.get('Content-Length', '0'))
         raw = self.rfile.read(length) if length else b'{}'
         try:
@@ -68,22 +101,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self._json(400, {'error': 'invalid json'})
 
-        msg = payload.get('message') or {}
-        if msg:
-            chat = msg.get('chat') or {}
-            from_user = msg.get('from') or {}
-            record = {
-                'ok': True,
-                'type': 'message',
-                'chat_id': chat.get('id'),
-                'text': msg.get('text', ''),
-                'from': {
-                    'id': from_user.get('id'),
-                    'username': from_user.get('username'),
-                }
-            }
-            print(json.dumps(record, ensure_ascii=False), flush=True)
-            return self._json(200, record)
+        if self.path == '/approval/event':
+            event = append_event(payload)
+            return self._json(200, {'ok': True, 'event': event})
+
+        if self.path != '/telegram/callback':
+            return self._json(404, {'error': 'not found'})
 
         cq = payload.get('callback_query') or {}
         parsed = parse_callback_data(cq.get('data'))
@@ -91,8 +114,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {'error': 'invalid callback_data'})
         if not BOT_TOKEN:
             return self._json(500, {'error': 'missing TELEGRAM_BOT_TOKEN'})
-        if not APPROVAL_EVENT_URL:
-            return self._json(500, {'error': 'missing F1_APPROVAL_EVENT_URL'})
 
         action = parsed['action']
         answer_text = '✅ 已通过' if action == 'approve' else '🔁 已标记重做'
@@ -100,12 +121,16 @@ class Handler(BaseHTTPRequestHandler):
             'callback_query_id': cq.get('id', ''),
             'text': answer_text,
         })
-        event_result = post_json(APPROVAL_EVENT_URL, {
+        event_payload = {
             **parsed,
             'source': 'telegram_external_webhook',
             'callback_query_id': cq.get('id', ''),
             'raw_data': cq.get('data', ''),
-        })
+        }
+        if FORWARD_MODE == 'forward' and APPROVAL_EVENT_URL:
+            event_result = post_json(APPROVAL_EVENT_URL, event_payload)
+        else:
+            event_result = {'ok': True, 'stored': True, 'event': append_event(event_payload)}
         return self._json(200, {
             'ok': True,
             'answer_result': answer_result,
